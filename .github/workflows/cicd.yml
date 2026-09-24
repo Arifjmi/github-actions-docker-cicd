@@ -1,4 +1,4 @@
-name: Docker CI Pipeline
+name: Docker CI/CD Pipeline
 
 on:
   push:
@@ -7,38 +7,49 @@ on:
 
 jobs:
 
+  # ==========================================
+  # JOB 1: TEST + BUILD + PUSH
+  # ==========================================
+
   build-test-push:
 
     runs-on: ubuntu-latest
 
     steps:
 
+      # Step 1: Checkout source code
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # Step 2: Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
           cache: npm
 
+      # Step 3: Install dependencies
       - name: Install Dependencies
         run: npm ci
 
+      # Step 4: Start application
       - name: Start Application
         run: |
           npm start > app.log 2>&1 &
           sleep 3
 
+      # Step 5: Run application tests
       - name: Run Tests
         run: npm test
 
+      # Step 6: Login to Docker Hub
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # Step 7: Build Docker image
       - name: Build Docker Image
         run: |
           docker build \
@@ -46,12 +57,151 @@ jobs:
             -t ${{ secrets.DOCKER_USERNAME }}/demo-app:latest \
             .
 
+      # Step 8: Push Git SHA image
       - name: Push Versioned Image
         run: |
           docker push \
             ${{ secrets.DOCKER_USERNAME }}/demo-app:${{ github.sha }}
 
+      # Step 9: Push latest image
       - name: Push Latest Image
         run: |
           docker push \
             ${{ secrets.DOCKER_USERNAME }}/demo-app:latest
+
+
+  # ==========================================
+  # JOB 2: AUTOMATIC DEPLOYMENT TO EC2
+  # ==========================================
+
+  deploy:
+
+    # Deploy only if build-test-push succeeds
+    needs: build-test-push
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Deploy Application to EC2
+
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+
+          # Use the exact Git commit as the image version
+          IMAGE_TAG: ${{ github.sha }}
+
+        run: |
+
+          echo "======================================"
+          echo "Preparing SSH key"
+          echo "======================================"
+
+          echo "$EC2_SSH_KEY" > ec2-key.pem
+
+          chmod 600 ec2-key.pem
+
+
+          echo "======================================"
+          echo "Adding EC2 to known hosts"
+          echo "======================================"
+
+          mkdir -p ~/.ssh
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+
+          echo "======================================"
+          echo "Connecting to EC2"
+          echo "======================================"
+
+          ssh -i ec2-key.pem \
+            "$EC2_USERNAME@$EC2_HOST" \
+            "DOCKER_USERNAME='$DOCKER_USERNAME' IMAGE_TAG='$IMAGE_TAG' bash -s" << 'EOF'
+
+
+          # Stop the deployment if any command fails
+          set -e
+
+
+          echo "======================================"
+          echo "Docker version"
+          echo "======================================"
+
+          docker --version
+
+
+          echo "======================================"
+          echo "Pulling new Docker image"
+          echo "======================================"
+
+          docker pull "$DOCKER_USERNAME/demo-app:$IMAGE_TAG"
+
+
+          echo "======================================"
+          echo "Stopping old container"
+          echo "======================================"
+
+          docker stop demo-app 2>/dev/null || true
+
+
+          echo "======================================"
+          echo "Removing old container"
+          echo "======================================"
+
+          docker rm demo-app 2>/dev/null || true
+
+
+          echo "======================================"
+          echo "Starting new container"
+          echo "======================================"
+
+          docker run -d \
+            --name demo-app \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            "$DOCKER_USERNAME/demo-app:$IMAGE_TAG"
+
+
+          echo "======================================"
+          echo "Deployment successful"
+          echo "======================================"
+
+
+          echo "======================================"
+          echo "Running containers"
+          echo "======================================"
+
+          docker ps
+
+
+          echo "======================================"
+          echo "Testing application"
+          echo "======================================"
+
+          sleep 3
+
+          curl -f http://localhost:3000/health
+
+
+          echo ""
+          echo "======================================"
+          echo "Health check successful"
+          echo "======================================"
+
+          EOF
+
+
+          echo "======================================"
+          echo "Removing SSH key"
+          echo "======================================"
+
+          rm -f ec2-key.pem
+
+
+          echo "======================================"
+          echo "CI/CD deployment completed"
+          echo "======================================"
